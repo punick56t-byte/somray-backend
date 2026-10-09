@@ -711,8 +711,10 @@ async def transcribe_video(req: TranscribeRequest):
                 wav_tmp,
                 beam_size=1,
                 best_of=1,
+                condition_on_previous_text=False,
+                temperature=0.0,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=300)
+                vad_parameters=dict(min_silence_duration_ms=400)
             )
 
             parsed_list = []
