@@ -47,6 +47,8 @@ class TranslateRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     video_path: str = ""
 
+whisper_semaphore = asyncio.Semaphore(1)
+
 @app.get("/api/status")
 async def get_status():
     return {
@@ -504,7 +506,8 @@ def get_video_info(video_path: str) -> dict:
         "width": 1920,
         "height": 1080,
         "aspect_ratio": "16:9",
-        "has_audio": False
+        "has_audio": False,
+        "has_video": False
     }
     if not video_path or not os.path.exists(video_path):
         return info
@@ -519,6 +522,7 @@ def get_video_info(video_path: str) -> dict:
         info["duration"] = float(fmt.get("duration", 0.0))
         for s in data.get("streams", []):
             if s.get("codec_type") == "video":
+                info["has_video"] = True
                 w = int(s.get("width", 1920))
                 h = int(s.get("height", 1080))
                 info["width"] = w
@@ -910,6 +914,9 @@ async def dub_full_video(req: DubVideoRequest):
             for idx_orig, trans_txt in zip(to_batch_idx, translated_batch):
                 req.segments[idx_orig]["dubText"] = trans_txt
 
+        max_end_time = 0.0
+        prepared_segments = []
+        mute_intervals = []
         for idx, seg in enumerate(req.segments):
             text = seg.get("dubText") or seg.get("origText") or ""
             if not text.strip():
@@ -1104,34 +1111,44 @@ async def dub_full_video(req: DubVideoRequest):
         output_filename = f"dubbed_{req.target_lang}_{int(asyncio.get_event_loop().time())}.mp4"
         output_path = os.path.join(BASE_DIR, "assets", output_filename)
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_full,
-            "-i", final_audio_path,
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            output_path
-        ]
-
-        try:
+        if not video_info.get("has_video", False):
+            # Audio-only file (e.g. mp3/wav): export direct audio track
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", final_audio_path,
+                "-c:a", "aac", "-b:a", "192k",
+                output_path
+            ]
             subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as cpe:
-            print(f"Stream copy fallback ({cpe}), re-encoding video preserving native dimensions...", file=sys.stderr)
-            cmd_fallback = [
+        else:
+            cmd = [
                 "ffmpeg", "-y",
                 "-i", video_full,
                 "-i", final_audio_path,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p",
+                "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
                 output_path
             ]
-            subprocess.run(cmd_fallback, check=True, capture_output=True)
+
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+            except subprocess.CalledProcessError as cpe:
+                print(f"Stream copy fallback ({cpe}), re-encoding video preserving native dimensions...", file=sys.stderr)
+                cmd_fallback = [
+                    "ffmpeg", "-y",
+                    "-i", video_full,
+                    "-i", final_audio_path,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-shortest",
+                    output_path
+                ]
+                subprocess.run(cmd_fallback, check=True, capture_output=True)
 
         # Also copy to clean named video for direct download matching
         orig_base = os.path.basename(video_full)
