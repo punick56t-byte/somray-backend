@@ -404,7 +404,7 @@ def get_whisper():
     if whisper_model is None:
         try:
             from faster_whisper import WhisperModel
-            whisper_model = WhisperModel('base', device='cpu', compute_type='int8')
+            whisper_model = WhisperModel('tiny', device='cpu', compute_type='int8')
         except Exception as e:
             print(f"Failed to load faster_whisper: {e}", file=sys.stderr)
     return whisper_model
