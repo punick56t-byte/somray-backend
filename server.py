@@ -1083,12 +1083,17 @@ async def dub_full_video(req: DubVideoRequest):
         except Exception:
             pass
 
-app.mount("/assets", StaticFiles(directory=os.path.join(BASE_DIR, "assets")), name="assets")
+assets_dir = os.path.join(BASE_DIR, "assets")
+os.makedirs(assets_dir, exist_ok=True)
+app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
 @app.get("/")
 @app.get("/index.html")
 async def serve_index():
-    return FileResponse(os.path.join(BASE_DIR, "index.html"))
+    idx_path = os.path.join(BASE_DIR, "index.html")
+    if os.path.exists(idx_path):
+        return FileResponse(idx_path)
+    return {"status": "online", "app": "SOMRAY AI Dubbing Studio", "message": "Backend Cloud Server is running 100%!"}
 
 @app.get("/style.css")
 async def serve_css():
