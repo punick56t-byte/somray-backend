@@ -47,7 +47,40 @@ class TranslateRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     video_path: str = ""
 
-whisper_semaphore = asyncio.Semaphore(1)
+import threading
+
+class SafeWhisperLock:
+    """Thread-safe and loop-independent semaphore context.
+    Prevents 'Semaphore is bound to a different event loop' runtime error
+    across different asyncio event loops in Uvicorn / Render."""
+    def __init__(self):
+        self._locks = {}
+        self._thread_lock = threading.Lock()
+
+    def _get_lock(self):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        with self._thread_lock:
+            if loop not in self._locks:
+                self._locks[loop] = asyncio.Lock()
+            return self._locks[loop]
+
+    async def __aenter__(self):
+        lock = self._get_lock()
+        await lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        try:
+            lock = self._get_lock()
+            if lock.locked():
+                lock.release()
+        except Exception:
+            pass
+
+whisper_semaphore = SafeWhisperLock()
 
 @app.get("/api/status")
 async def get_status():
@@ -1287,7 +1320,28 @@ async def download_file(file: str = ""):
 
 # --- Async Background Job Queue System (Zero-Timeout, 10-20 Users Safe, Max 10 Min) ---
 dub_jobs = {}
-job_queue = asyncio.Queue()
+class SafeJobQueue:
+    def __init__(self):
+        self._q = None
+
+    def _get_q(self):
+        if self._q is None:
+            self._q = asyncio.Queue()
+        return self._q
+
+    async def put(self, item):
+        return await self._get_q().put(item)
+
+    async def get(self):
+        return await self._get_q().get()
+
+    def qsize(self):
+        return self._get_q().qsize()
+
+    def task_done(self):
+        return self._get_q().task_done()
+
+job_queue = SafeJobQueue()
 
 class SubmitJobRequest(BaseModel):
     video_path: str = ""
