@@ -47,40 +47,6 @@ class TranslateRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     video_path: str = ""
 
-import threading
-
-class SafeWhisperLock:
-    """Thread-safe and loop-independent semaphore context.
-    Prevents 'Semaphore is bound to a different event loop' runtime error
-    across different asyncio event loops in Uvicorn / Render."""
-    def __init__(self):
-        self._locks = {}
-        self._thread_lock = threading.Lock()
-
-    def _get_lock(self):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        with self._thread_lock:
-            if loop not in self._locks:
-                self._locks[loop] = asyncio.Lock()
-            return self._locks[loop]
-
-    async def __aenter__(self):
-        lock = self._get_lock()
-        await lock.acquire()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        try:
-            lock = self._get_lock()
-            if lock.locked():
-                lock.release()
-        except Exception:
-            pass
-
-whisper_semaphore = SafeWhisperLock()
 
 @app.get("/api/status")
 async def get_status():
@@ -839,22 +805,21 @@ async def transcribe_video(req: TranscribeRequest):
                 d.text = gs["text"]
                 raw_segments.append(d)
         else:
-            # Engine 2: Local faster-whisper with semaphore (ensures Render 512MB RAM never OOMs)
-            async with whisper_semaphore:
-                model = get_whisper()
-                if not model:
-                    raise HTTPException(status_code=500, detail="Whisper model not initialized")
-                whisper_segs, info = model.transcribe(
-                    wav_tmp,
-                    beam_size=1,
-                    best_of=1,
-                    condition_on_previous_text=False,
-                    temperature=0.0,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=400)
-                )
-                detected_lang = getattr(info, 'language', 'auto') if info else 'auto'
-                raw_segments = list(whisper_segs)
+            # Engine 2: Local faster-whisper
+            model = get_whisper()
+            if not model:
+                raise HTTPException(status_code=500, detail="Whisper model not initialized")
+            whisper_segs, info = model.transcribe(
+                wav_tmp,
+                beam_size=1,
+                best_of=1,
+                condition_on_previous_text=False,
+                temperature=0.0,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=400)
+            )
+            detected_lang = getattr(info, 'language', 'auto') if info else 'auto'
+            raw_segments = list(whisper_segs)
 
         parsed_list = []
         idx = 1
@@ -1437,20 +1402,19 @@ async def dub_worker():
                         d.text = gs["text"]
                         raw_segments.append(d)
                 else:
-                    async with whisper_semaphore:
-                        model = get_whisper()
-                        if model:
-                            whisper_segs, info = model.transcribe(
-                                wav_tmp,
-                                beam_size=1,
-                                best_of=1,
-                                condition_on_previous_text=False,
-                                temperature=0.0,
-                                vad_filter=True,
-                                vad_parameters=dict(min_silence_duration_ms=400)
-                            )
-                            detected_lang = getattr(info, 'language', 'auto') if info else 'auto'
-                            raw_segments = list(whisper_segs)
+                    model = get_whisper()
+                    if model:
+                        whisper_segs, info = model.transcribe(
+                            wav_tmp,
+                            beam_size=1,
+                            best_of=1,
+                            condition_on_previous_text=False,
+                            temperature=0.0,
+                            vad_filter=True,
+                            vad_parameters=dict(min_silence_duration_ms=400)
+                        )
+                        detected_lang = getattr(info, 'language', 'auto') if info else 'auto'
+                        raw_segments = list(whisper_segs)
 
                 import scipy.io.wavfile as wavfile
                 import numpy as np
