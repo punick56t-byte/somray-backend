@@ -934,31 +934,14 @@ async def dub_full_video(req: DubVideoRequest):
                     text = translate_to_target(text, target="km")
                 text = condense_khmer_for_duration(text, slot_dur)
 
-            # Determine character voice
-            if req.voice in ("male", "male-en"):
-                voice = "km-KH-PisethNeural" if req.target_lang == "km" else "en-US-GuyNeural"
-            elif req.voice in ("female", "female-en"):
+            # Determine character voice: strictly 100% unified across all segments
+            if req.voice in ("female", "female-en"):
                 voice = "km-KH-SreymomNeural" if req.target_lang == "km" else "en-US-JennyNeural"
-            elif req.voice in ("dual", "both", "auto", "multi-character") or not req.voice:
-                spk = str(seg.get("speaker", "")).lower()
-                is_female = (seg.get("gender") == "female" or any(w in spk for w in ["ស្រី", "woman", "female"])) and (seg.get("gender") != "male")
-                if req.target_lang == "km":
-                    voice = "km-KH-SreymomNeural" if is_female else "km-KH-PisethNeural"
-                else:
-                    voice = "en-US-JennyNeural" if is_female else "en-US-GuyNeural"
-            elif seg.get("voice") in ("km-KH-PisethNeural", "km-KH-SreymomNeural", "en-US-GuyNeural", "en-US-JennyNeural"):
-                voice = seg.get("voice")
             else:
                 voice = "km-KH-PisethNeural" if req.target_lang == "km" else "en-US-GuyNeural"
 
-            # Pre-tune Edge-TTS speaking rate to match mouth timing naturally
-            char_count = len(re.sub(r'[\s\u200b\.,!?:;\-\–]', '', text))
-            est_dur = char_count * 0.095
-            rate_pct = 0
-            if est_dur > slot_dur * 1.05:
-                # Keep rate gentle (+4% to +12%) so voice remains human and clear
-                rate_pct = min(12, max(4, int((est_dur / slot_dur - 1.0) * 40)))
-            rate_str = f"+{rate_pct}%"
+            # Natural, comfortable human tempo (never rushed)
+            rate_str = "+0%"
 
             mute_intervals.append(f"between(t,{start_s:.2f},{end_s:.2f})")
 
@@ -1016,21 +999,6 @@ async def dub_full_video(req: DubVideoRequest):
                         silent_samples = np.zeros(int(max(0.4, slot_dur) * SR), dtype=np.int16)
                         wavfile.write(wav_path, SR, silent_samples)
                 
-                # Perfect Lip-Sync: in-memory linear interpolation (0 subprocesses, ultra-fast!)
-                if os.path.exists(wav_path) and os.path.getsize(wav_path) > 44:
-                    try:
-                        sr_in, data = wavfile.read(wav_path)
-                        actual_dur = len(data) / sr_in
-                        if actual_dur > slot_dur * 1.05 and slot_dur > 0.35:
-                            target_len = int(slot_dur * sr_in)
-                            if target_len > 0 and len(data) > target_len:
-                                x_old = np.linspace(0, 1, len(data))
-                                x_new = np.linspace(0, 1, target_len)
-                                resampled = np.interp(x_new, x_old, data.astype(np.float32)).astype(np.int16)
-                                wavfile.write(wav_path, sr_in, resampled)
-                    except Exception as sync_err:
-                        pass
-
                 seg_info["wav_path"] = wav_path
                 return seg_info
 
@@ -1411,14 +1379,16 @@ async def dub_worker():
                     start_val = round(s.start, 2)
                     end_val = round(s.end, 2)
                     slot_dur = max(0.4, round(end_val - start_val, 2))
-                    gender, pitch_hz = detect_audio_character_gender(full_audio_data, start_val, end_val, txt)
-                    voice = 'km-KH-SreymomNeural' if gender == 'female' else 'km-KH-PisethNeural'
-                    speaker_name = f'តួអង្គ {idx} ({"ស្រី" if gender == "female" else "ប្រុស"})'
+                    user_voice_choice = job.get("voice", "male")
+                    is_female_target = user_voice_choice in ("female", "female-en")
+                    voice = 'km-KH-SreymomNeural' if (is_female_target and job.get("target_lang") == "km") else ('en-US-JennyNeural' if is_female_target else ('km-KH-PisethNeural' if job.get("target_lang") == "km" else 'en-US-GuyNeural'))
+                    gender = 'female' if is_female_target else 'male'
+                    speaker_name = f'តួអង្គ {idx} ({"ស្រី" if is_female_target else "ប្រុស"})'
                     parsed_list.append({
                         'id': idx,
                         'speaker': speaker_name,
                         'gender': gender,
-                        'gender_label': f'👩 តួស្រី' if gender == 'female' else f'👨 តួប្រុស',
+                        'gender_label': '👩 តួស្រី' if is_female_target else '👨 តួប្រុស',
                         'start': start_val,
                         'end': end_val,
                         'slot_dur': slot_dur,
@@ -1492,10 +1462,30 @@ async def cleanup_worker():
         except Exception:
             pass
 
+async def render_keep_alive_worker():
+    """Keeps Render Free Tier 100% awake by pinging public health check every 10 minutes (Prevents 50s spin-down)"""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://somray-ai-dubbing.onrender.com")
+            ping_url = f"{render_url.rstrip('/')}/api/status"
+            def _ping():
+                import urllib.request
+                req = urllib.request.Request(ping_url, headers={"User-Agent": "SOMRAY-KeepAlive/1.0"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    return r.status
+            status = await asyncio.to_thread(_ping)
+            if status == 200:
+                print(f"[KeepAlive] Instance pinged {ping_url} (100% Awake)")
+        except Exception:
+            pass
+        await asyncio.sleep(600)  # Ping every 10 minutes (well below Render 15-minute sleep threshold)
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(dub_worker())
     asyncio.create_task(cleanup_worker())
+    asyncio.create_task(render_keep_alive_worker())
 
 def get_local_ip():
     try:
