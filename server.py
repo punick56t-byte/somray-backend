@@ -288,6 +288,22 @@ def polish_khmer_grammar(text: str, source_text: str = "") -> str:
     cleaned = re.sub(r'កាលពីអតីតកាល\s*', 'ពីមុន', cleaned)
     cleaned = re.sub(r'ផងដែរ$', 'ដែរ', cleaned)
 
+    # Rule 9: Conversational Cinematic Natural Expressions
+    cleaned = re.sub(r'តើអ្នកសុខសប្បាយជាទេ[?!]*', 'ឯងមិនអីទេមែនទេ?!', cleaned)
+    cleaned = re.sub(r'តើឯងសុខសប្បាយទេ[?!]*', 'ឯងមិនអីទេហ្អី?!', cleaned)
+    cleaned = re.sub(r'សូមអភ័យទោស[?!]*', 'សុំទោស!', cleaned)
+    cleaned = re.sub(r'តើអ្នកចង់មានន័យយ៉ាងណា[?!]*', 'ចង់មានន័យថាម៉េច?!', cleaned)
+    cleaned = re.sub(r'តើឯងចង់មានន័យថាម៉េច[?!]*', 'ចង់មានន័យថាម៉េច?!', cleaned)
+    cleaned = re.sub(r'ខ្ញុំមិនដឹងថាត្រូវនិយាយយ៉ាងណាទេ', 'ខ្ញុំមិនដឹងថានិយាយម៉េចទេ!', cleaned)
+    cleaned = re.sub(r'តើមានអ្វីកើតឡើងនៅទីនេះ[?!]*', 'មានរឿងអីនៅទីនេះ?!', cleaned)
+    cleaned = re.sub(r'ប្រាប់ខ្ញុំមក[?!]*', 'ប្រាប់មក!', cleaned)
+    cleaned = re.sub(r'ទៅឱ្យឆ្ងាយ[?!]*', 'ទៅឱ្យឆ្ងាយទៅ!', cleaned)
+    cleaned = re.sub(r'ចាំបន្តិចសិន[?!]*', 'ចាំបន្តិច!', cleaned)
+    cleaned = re.sub(r'ប្រយ័ត្នខ្លួន[?!]*', 'ប្រយ័ត្ន!', cleaned)
+    cleaned = re.sub(r'កុំបារម្ភអី[?!]*', 'កុំបារម្ភ!', cleaned)
+    cleaned = re.sub(r'ខ្ញុំត្រូវតែទៅហើយ', 'ខ្ញុំត្រូវទៅហើយ!', cleaned)
+    cleaned = re.sub(r'តើយើងគួរធ្វើអ្វី[?!]*', 'ធ្វើម៉េចឥឡូវ?!', cleaned)
+
     return cleaned.strip()
 
 def condense_khmer_for_duration(text: str, slot_duration: float) -> str:
@@ -1009,7 +1025,10 @@ async def dub_full_video(req: DubVideoRequest):
         total_samples = int(math.ceil(timeline_len_s * SR))
         master_buffer = np.zeros(total_samples, dtype=np.float32)
 
-        for seg_info in prepared_segments:
+        # Sort prepared_segments by start_s to guarantee strictly chronological assembly
+        prepared_segments.sort(key=lambda s: s["start_s"])
+
+        for i, seg_info in enumerate(prepared_segments):
             wav_path = seg_info.get("wav_path")
             if not wav_path or not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
                 continue
@@ -1019,6 +1038,20 @@ async def dub_full_video(req: DubVideoRequest):
                     continue
 
                 start_idx = int(seg_info["start_s"] * SR)
+
+                # Anti-Overlap Guarantee: speech must NEVER collide with next dialogue!
+                if i + 1 < len(prepared_segments):
+                    next_start_idx = int(prepared_segments[i + 1]["start_s"] * SR)
+                    if (start_idx + len(seg_samples)) > next_start_idx:
+                        max_allowed = max(int(0.25 * SR), next_start_idx - start_idx - int(0.04 * SR))
+                        if len(seg_samples) > max_allowed:
+                            seg_samples = seg_samples[:max_allowed]
+                            # 50ms smooth fadeout to prevent clicking and ensure clean pause
+                            fade_len = min(int(0.05 * SR), len(seg_samples))
+                            if fade_len > 0:
+                                fade_curve = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                                seg_samples[-fade_len:] = (seg_samples[-fade_len:].astype(np.float32) * fade_curve).astype(np.int16)
+
                 end_idx = start_idx + len(seg_samples)
 
                 if start_idx < total_samples:
@@ -1370,22 +1403,23 @@ async def dub_worker():
                 sr_audio, full_audio_data = wavfile.read(wav_tmp)
                 full_audio_data = full_audio_data.astype(np.float32)
 
+                raw_segments.sort(key=lambda s: getattr(s, 'start', 0.0))
                 parsed_list = []
-                idx = 1
-                for s in raw_segments:
+                for i, s in enumerate(raw_segments):
                     if s.start > 600.0: break
                     txt = s.text.strip()
                     if not txt or len(txt) < 1: continue
                     start_val = round(s.start, 2)
                     end_val = round(s.end, 2)
-                    slot_dur = max(0.4, round(end_val - start_val, 2))
+                    next_start = raw_segments[i + 1].start if (i + 1 < len(raw_segments)) else (start_val + 3.0)
+                    slot_dur = max(0.4, round(min(end_val - start_val, max(0.5, next_start - start_val - 0.05)), 2))
                     user_voice_choice = job.get("voice", "male")
                     is_female_target = user_voice_choice in ("female", "female-en")
                     voice = 'km-KH-SreymomNeural' if (is_female_target and job.get("target_lang") == "km") else ('en-US-JennyNeural' if is_female_target else ('km-KH-PisethNeural' if job.get("target_lang") == "km" else 'en-US-GuyNeural'))
                     gender = 'female' if is_female_target else 'male'
-                    speaker_name = f'តួអង្គ {idx} ({"ស្រី" if is_female_target else "ប្រុស"})'
+                    speaker_name = f'តួអង្គ {len(parsed_list) + 1} ({"ស្រី" if is_female_target else "ប្រុស"})'
                     parsed_list.append({
-                        'id': idx,
+                        'id': len(parsed_list) + 1,
                         'speaker': speaker_name,
                         'gender': gender,
                         'gender_label': '👩 តួស្រី' if is_female_target else '👨 តួប្រុស',
@@ -1395,7 +1429,6 @@ async def dub_worker():
                         'origText': txt,
                         'voice': voice
                     })
-                    idx += 1
 
                 # 2. Batch Translation (0.15s)
                 job["stage"] = "translating"
