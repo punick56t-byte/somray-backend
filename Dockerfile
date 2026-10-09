@@ -12,6 +12,9 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download Whisper tiny model into image so runtime has 0s delay!
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8')"
+
 # Copy application files
 COPY . /app/
 
