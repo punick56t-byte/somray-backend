@@ -404,7 +404,7 @@ def get_whisper():
     if whisper_model is None:
         try:
             from faster_whisper import WhisperModel
-            whisper_model = WhisperModel('tiny', device='cpu', compute_type='int8')
+            whisper_model = WhisperModel('tiny', device='cpu', compute_type='int8', cpu_threads=4)
         except Exception as e:
             print(f"Failed to load faster_whisper: {e}", file=sys.stderr)
     return whisper_model
@@ -544,6 +544,9 @@ def has_audio_track(video_path: str) -> bool:
     info = get_video_info(video_path)
     return info["has_audio"]
 
+import functools
+
+@functools.lru_cache(maxsize=8192)
 def translate_to_target(text: str, target: str = "km") -> str:
     """Natural contextual translation from any language to Khmer/English with fallback engines"""
     if not text or not text.strip():
@@ -643,8 +646,8 @@ def batch_translate_to_target(texts: list, target: str = "km") -> list:
         i, t = item
         return i, translate_to_target(t, target)
 
-    # Use 12 concurrent workers for high-speed translation
-    with ThreadPoolExecutor(max_workers=12) as executor:
+    # Use 16 concurrent workers for high-speed translation
+    with ThreadPoolExecutor(max_workers=16) as executor:
         for i, trans_text in executor.map(fetch_trans, to_translate):
             results[i] = trans_text
 
@@ -706,9 +709,10 @@ async def transcribe_video(req: TranscribeRequest):
             # vad_filter=True removes background music & silences in 1-2 hour movies
             raw_segments, info = model.transcribe(
                 wav_tmp,
-                beam_size=3,
+                beam_size=1,
+                best_of=1,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=400)
+                vad_parameters=dict(min_silence_duration_ms=300)
             )
 
             parsed_list = []
@@ -807,10 +811,18 @@ async def dub_full_video(req: DubVideoRequest):
     SR = 24000  # High-fidelity 24kHz sample rate for Edge-TTS neural speech
 
     try:
-        # Step 1: Prepare segments with duration condensation and voice assignment
-        prepared_segments = []
-        mute_intervals = []
-        max_end_time = 0.0
+        # High-speed parallel batch-translation for any segments lacking target translation
+        to_batch_idx = []
+        to_batch_txt = []
+        for i, s in enumerate(req.segments):
+            t = s.get("dubText") or s.get("origText") or ""
+            if req.target_lang == "km" and not re.search(r'[\u1780-\u17ff]', t) and t.strip():
+                to_batch_idx.append(i)
+                to_batch_txt.append(t.strip())
+        if to_batch_txt:
+            translated_batch = batch_translate_to_target(to_batch_txt, target=req.target_lang)
+            for idx_orig, trans_txt in zip(to_batch_idx, translated_batch):
+                req.segments[idx_orig]["dubText"] = trans_txt
 
         for idx, seg in enumerate(req.segments):
             text = seg.get("dubText") or seg.get("origText") or ""
@@ -911,20 +923,20 @@ async def dub_full_video(req: DubVideoRequest):
                         silent_samples = np.zeros(int(max(0.4, slot_dur) * SR), dtype=np.int16)
                         wavfile.write(wav_path, SR, silent_samples)
                 
-                # Perfect Lip-Sync: gentle atempo adjustment (max 1.20)
+                # Perfect Lip-Sync: in-memory linear interpolation (0 subprocesses, ultra-fast!)
                 if os.path.exists(wav_path) and os.path.getsize(wav_path) > 44:
                     try:
                         sr_in, data = wavfile.read(wav_path)
                         actual_dur = len(data) / sr_in
-                        if actual_dur > slot_dur * 1.03:
-                            tempo = min(1.20, round(actual_dur / max(0.35, slot_dur), 2))
-                            if tempo > 1.03:
-                                synced_wav = os.path.join(tmp_dir, f"synced_{idx}.wav")
-                                subprocess.run(['ffmpeg', '-y', '-i', wav_path, '-filter:a', f'atempo={tempo}', '-ar', str(SR), '-ac', '1', synced_wav], capture_output=True, check=True)
-                                if os.path.exists(synced_wav):
-                                    os.replace(synced_wav, wav_path)
+                        if actual_dur > slot_dur * 1.05 and slot_dur > 0.35:
+                            target_len = int(slot_dur * sr_in)
+                            if target_len > 0 and len(data) > target_len:
+                                x_old = np.linspace(0, 1, len(data))
+                                x_new = np.linspace(0, 1, target_len)
+                                resampled = np.interp(x_new, x_old, data.astype(np.float32)).astype(np.int16)
+                                wavfile.write(wav_path, sr_in, resampled)
                     except Exception as sync_err:
-                        print(f"Sync check note on segment {idx}: {sync_err}", file=sys.stderr)
+                        pass
 
                 seg_info["wav_path"] = wav_path
                 return seg_info
