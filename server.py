@@ -47,6 +47,7 @@ class TranslateRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     video_path: str = ""
 
+whisper_semaphore = asyncio.Semaphore(1)
 
 @app.get("/api/status")
 async def get_status():
@@ -286,22 +287,6 @@ def polish_khmer_grammar(text: str, source_text: str = "") -> str:
     cleaned = re.sub(r'នៅក្នុងខណៈពេលដែល\s*', 'ពេលដែល', cleaned)
     cleaned = re.sub(r'កាលពីអតីតកាល\s*', 'ពីមុន', cleaned)
     cleaned = re.sub(r'ផងដែរ$', 'ដែរ', cleaned)
-
-    # Rule 9: Conversational Cinematic Natural Expressions
-    cleaned = re.sub(r'តើអ្នកសុខសប្បាយជាទេ[?!]*', 'ឯងមិនអីទេមែនទេ?!', cleaned)
-    cleaned = re.sub(r'តើឯងសុខសប្បាយទេ[?!]*', 'ឯងមិនអីទេហ្អី?!', cleaned)
-    cleaned = re.sub(r'សូមអភ័យទោស[?!]*', 'សុំទោស!', cleaned)
-    cleaned = re.sub(r'តើអ្នកចង់មានន័យយ៉ាងណា[?!]*', 'ចង់មានន័យថាម៉េច?!', cleaned)
-    cleaned = re.sub(r'តើឯងចង់មានន័យថាម៉េច[?!]*', 'ចង់មានន័យថាម៉េច?!', cleaned)
-    cleaned = re.sub(r'ខ្ញុំមិនដឹងថាត្រូវនិយាយយ៉ាងណាទេ', 'ខ្ញុំមិនដឹងថានិយាយម៉េចទេ!', cleaned)
-    cleaned = re.sub(r'តើមានអ្វីកើតឡើងនៅទីនេះ[?!]*', 'មានរឿងអីនៅទីនេះ?!', cleaned)
-    cleaned = re.sub(r'ប្រាប់ខ្ញុំមក[?!]*', 'ប្រាប់មក!', cleaned)
-    cleaned = re.sub(r'ទៅឱ្យឆ្ងាយ[?!]*', 'ទៅឱ្យឆ្ងាយទៅ!', cleaned)
-    cleaned = re.sub(r'ចាំបន្តិចសិន[?!]*', 'ចាំបន្តិច!', cleaned)
-    cleaned = re.sub(r'ប្រយ័ត្នខ្លួន[?!]*', 'ប្រយ័ត្ន!', cleaned)
-    cleaned = re.sub(r'កុំបារម្ភអី[?!]*', 'កុំបារម្ភ!', cleaned)
-    cleaned = re.sub(r'ខ្ញុំត្រូវតែទៅហើយ', 'ខ្ញុំត្រូវទៅហើយ!', cleaned)
-    cleaned = re.sub(r'តើយើងគួរធ្វើអ្វី[?!]*', 'ធ្វើម៉េចឥឡូវ?!', cleaned)
 
     return cleaned.strip()
 
@@ -805,21 +790,22 @@ async def transcribe_video(req: TranscribeRequest):
                 d.text = gs["text"]
                 raw_segments.append(d)
         else:
-            # Engine 2: Local faster-whisper
-            model = get_whisper()
-            if not model:
-                raise HTTPException(status_code=500, detail="Whisper model not initialized")
-            whisper_segs, info = model.transcribe(
-                wav_tmp,
-                beam_size=1,
-                best_of=1,
-                condition_on_previous_text=False,
-                temperature=0.0,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=400)
-            )
-            detected_lang = getattr(info, 'language', 'auto') if info else 'auto'
-            raw_segments = list(whisper_segs)
+            # Engine 2: Local faster-whisper with semaphore (ensures Render 512MB RAM never OOMs)
+            async with whisper_semaphore:
+                model = get_whisper()
+                if not model:
+                    raise HTTPException(status_code=500, detail="Whisper model not initialized")
+                whisper_segs, info = model.transcribe(
+                    wav_tmp,
+                    beam_size=1,
+                    best_of=1,
+                    condition_on_previous_text=False,
+                    temperature=0.0,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=400)
+                )
+                detected_lang = getattr(info, 'language', 'auto') if info else 'auto'
+                raw_segments = list(whisper_segs)
 
         parsed_list = []
         idx = 1
@@ -948,14 +934,31 @@ async def dub_full_video(req: DubVideoRequest):
                     text = translate_to_target(text, target="km")
                 text = condense_khmer_for_duration(text, slot_dur)
 
-            # Determine character voice: strictly 100% unified across all segments
-            if req.voice in ("female", "female-en"):
+            # Determine character voice
+            if req.voice in ("male", "male-en"):
+                voice = "km-KH-PisethNeural" if req.target_lang == "km" else "en-US-GuyNeural"
+            elif req.voice in ("female", "female-en"):
                 voice = "km-KH-SreymomNeural" if req.target_lang == "km" else "en-US-JennyNeural"
+            elif req.voice in ("dual", "both", "auto", "multi-character") or not req.voice:
+                spk = str(seg.get("speaker", "")).lower()
+                is_female = (seg.get("gender") == "female" or any(w in spk for w in ["ស្រី", "woman", "female"])) and (seg.get("gender") != "male")
+                if req.target_lang == "km":
+                    voice = "km-KH-SreymomNeural" if is_female else "km-KH-PisethNeural"
+                else:
+                    voice = "en-US-JennyNeural" if is_female else "en-US-GuyNeural"
+            elif seg.get("voice") in ("km-KH-PisethNeural", "km-KH-SreymomNeural", "en-US-GuyNeural", "en-US-JennyNeural"):
+                voice = seg.get("voice")
             else:
                 voice = "km-KH-PisethNeural" if req.target_lang == "km" else "en-US-GuyNeural"
 
-            # Natural, comfortable human tempo (never rushed)
-            rate_str = "+0%"
+            # Pre-tune Edge-TTS speaking rate to match mouth timing naturally
+            char_count = len(re.sub(r'[\s\u200b\.,!?:;\-\–]', '', text))
+            est_dur = char_count * 0.095
+            rate_pct = 0
+            if est_dur > slot_dur * 1.05:
+                # Keep rate gentle (+4% to +12%) so voice remains human and clear
+                rate_pct = min(12, max(4, int((est_dur / slot_dur - 1.0) * 40)))
+            rate_str = f"+{rate_pct}%"
 
             mute_intervals.append(f"between(t,{start_s:.2f},{end_s:.2f})")
 
@@ -1013,6 +1016,21 @@ async def dub_full_video(req: DubVideoRequest):
                         silent_samples = np.zeros(int(max(0.4, slot_dur) * SR), dtype=np.int16)
                         wavfile.write(wav_path, SR, silent_samples)
                 
+                # Perfect Lip-Sync: in-memory linear interpolation (0 subprocesses, ultra-fast!)
+                if os.path.exists(wav_path) and os.path.getsize(wav_path) > 44:
+                    try:
+                        sr_in, data = wavfile.read(wav_path)
+                        actual_dur = len(data) / sr_in
+                        if actual_dur > slot_dur * 1.05 and slot_dur > 0.35:
+                            target_len = int(slot_dur * sr_in)
+                            if target_len > 0 and len(data) > target_len:
+                                x_old = np.linspace(0, 1, len(data))
+                                x_new = np.linspace(0, 1, target_len)
+                                resampled = np.interp(x_new, x_old, data.astype(np.float32)).astype(np.int16)
+                                wavfile.write(wav_path, sr_in, resampled)
+                    except Exception as sync_err:
+                        pass
+
                 seg_info["wav_path"] = wav_path
                 return seg_info
 
@@ -1023,10 +1041,7 @@ async def dub_full_video(req: DubVideoRequest):
         total_samples = int(math.ceil(timeline_len_s * SR))
         master_buffer = np.zeros(total_samples, dtype=np.float32)
 
-        # Sort prepared_segments by start_s to guarantee strictly chronological assembly
-        prepared_segments.sort(key=lambda s: s["start_s"])
-
-        for i, seg_info in enumerate(prepared_segments):
+        for seg_info in prepared_segments:
             wav_path = seg_info.get("wav_path")
             if not wav_path or not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
                 continue
@@ -1036,20 +1051,6 @@ async def dub_full_video(req: DubVideoRequest):
                     continue
 
                 start_idx = int(seg_info["start_s"] * SR)
-
-                # Anti-Overlap Guarantee: speech must NEVER collide with next dialogue!
-                if i + 1 < len(prepared_segments):
-                    next_start_idx = int(prepared_segments[i + 1]["start_s"] * SR)
-                    if (start_idx + len(seg_samples)) > next_start_idx:
-                        max_allowed = max(int(0.25 * SR), next_start_idx - start_idx - int(0.04 * SR))
-                        if len(seg_samples) > max_allowed:
-                            seg_samples = seg_samples[:max_allowed]
-                            # 50ms smooth fadeout to prevent clicking and ensure clean pause
-                            fade_len = min(int(0.05 * SR), len(seg_samples))
-                            if fade_len > 0:
-                                fade_curve = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
-                                seg_samples[-fade_len:] = (seg_samples[-fade_len:].astype(np.float32) * fade_curve).astype(np.int16)
-
                 end_idx = start_idx + len(seg_samples)
 
                 if start_idx < total_samples:
@@ -1285,28 +1286,7 @@ async def download_file(file: str = ""):
 
 # --- Async Background Job Queue System (Zero-Timeout, 10-20 Users Safe, Max 10 Min) ---
 dub_jobs = {}
-class SafeJobQueue:
-    def __init__(self):
-        self._q = None
-
-    def _get_q(self):
-        if self._q is None:
-            self._q = asyncio.Queue()
-        return self._q
-
-    async def put(self, item):
-        return await self._get_q().put(item)
-
-    async def get(self):
-        return await self._get_q().get()
-
-    def qsize(self):
-        return self._get_q().qsize()
-
-    def task_done(self):
-        return self._get_q().task_done()
-
-job_queue = SafeJobQueue()
+job_queue = asyncio.Queue()
 
 class SubmitJobRequest(BaseModel):
     video_path: str = ""
@@ -1402,51 +1382,50 @@ async def dub_worker():
                         d.text = gs["text"]
                         raw_segments.append(d)
                 else:
-                    model = get_whisper()
-                    if model:
-                        whisper_segs, info = model.transcribe(
-                            wav_tmp,
-                            beam_size=1,
-                            best_of=1,
-                            condition_on_previous_text=False,
-                            temperature=0.0,
-                            vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=400)
-                        )
-                        detected_lang = getattr(info, 'language', 'auto') if info else 'auto'
-                        raw_segments = list(whisper_segs)
+                    async with whisper_semaphore:
+                        model = get_whisper()
+                        if model:
+                            whisper_segs, info = model.transcribe(
+                                wav_tmp,
+                                beam_size=1,
+                                best_of=1,
+                                condition_on_previous_text=False,
+                                temperature=0.0,
+                                vad_filter=True,
+                                vad_parameters=dict(min_silence_duration_ms=400)
+                            )
+                            detected_lang = getattr(info, 'language', 'auto') if info else 'auto'
+                            raw_segments = list(whisper_segs)
 
                 import scipy.io.wavfile as wavfile
                 import numpy as np
                 sr_audio, full_audio_data = wavfile.read(wav_tmp)
                 full_audio_data = full_audio_data.astype(np.float32)
 
-                raw_segments.sort(key=lambda s: getattr(s, 'start', 0.0))
                 parsed_list = []
-                for i, s in enumerate(raw_segments):
+                idx = 1
+                for s in raw_segments:
                     if s.start > 600.0: break
                     txt = s.text.strip()
                     if not txt or len(txt) < 1: continue
                     start_val = round(s.start, 2)
                     end_val = round(s.end, 2)
-                    next_start = raw_segments[i + 1].start if (i + 1 < len(raw_segments)) else (start_val + 3.0)
-                    slot_dur = max(0.4, round(min(end_val - start_val, max(0.5, next_start - start_val - 0.05)), 2))
-                    user_voice_choice = job.get("voice", "male")
-                    is_female_target = user_voice_choice in ("female", "female-en")
-                    voice = 'km-KH-SreymomNeural' if (is_female_target and job.get("target_lang") == "km") else ('en-US-JennyNeural' if is_female_target else ('km-KH-PisethNeural' if job.get("target_lang") == "km" else 'en-US-GuyNeural'))
-                    gender = 'female' if is_female_target else 'male'
-                    speaker_name = f'តួអង្គ {len(parsed_list) + 1} ({"ស្រី" if is_female_target else "ប្រុស"})'
+                    slot_dur = max(0.4, round(end_val - start_val, 2))
+                    gender, pitch_hz = detect_audio_character_gender(full_audio_data, start_val, end_val, txt)
+                    voice = 'km-KH-SreymomNeural' if gender == 'female' else 'km-KH-PisethNeural'
+                    speaker_name = f'តួអង្គ {idx} ({"ស្រី" if gender == "female" else "ប្រុស"})'
                     parsed_list.append({
-                        'id': len(parsed_list) + 1,
+                        'id': idx,
                         'speaker': speaker_name,
                         'gender': gender,
-                        'gender_label': '👩 តួស្រី' if is_female_target else '👨 តួប្រុស',
+                        'gender_label': f'👩 តួស្រី' if gender == 'female' else f'👨 តួប្រុស',
                         'start': start_val,
                         'end': end_val,
                         'slot_dur': slot_dur,
                         'origText': txt,
                         'voice': voice
                     })
+                    idx += 1
 
                 # 2. Batch Translation (0.15s)
                 job["stage"] = "translating"
@@ -1513,30 +1492,10 @@ async def cleanup_worker():
         except Exception:
             pass
 
-async def render_keep_alive_worker():
-    """Keeps Render Free Tier 100% awake by pinging public health check every 10 minutes (Prevents 50s spin-down)"""
-    await asyncio.sleep(60)
-    while True:
-        try:
-            render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://somray-ai-dubbing.onrender.com")
-            ping_url = f"{render_url.rstrip('/')}/api/status"
-            def _ping():
-                import urllib.request
-                req = urllib.request.Request(ping_url, headers={"User-Agent": "SOMRAY-KeepAlive/1.0"})
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    return r.status
-            status = await asyncio.to_thread(_ping)
-            if status == 200:
-                print(f"[KeepAlive] Instance pinged {ping_url} (100% Awake)")
-        except Exception:
-            pass
-        await asyncio.sleep(600)  # Ping every 10 minutes (well below Render 15-minute sleep threshold)
-
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(dub_worker())
     asyncio.create_task(cleanup_worker())
-    asyncio.create_task(render_keep_alive_worker())
 
 def get_local_ip():
     try:
